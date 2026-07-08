@@ -983,6 +983,79 @@ func TestGetConfig_DataMountPathOverrideIsNormalized(t *testing.T) {
 	}
 }
 
+func TestGetConfig_NotificationWebhookConfigIsParsed(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("NOTIFICATION_WEBHOOK_URL", "https://example.com/hooks/doco-cd")
+	t.Setenv("NOTIFICATION_WEBHOOK_HEADERS", "X-Api-Key: secret")
+	t.Setenv("NOTIFICATION_WEBHOOK_LEVEL", "failure")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.NotificationWebhookURL != "https://example.com/hooks/doco-cd" {
+		t.Fatalf("expected NOTIFICATION_WEBHOOK_URL to be %q, got %q", "https://example.com/hooks/doco-cd", cfg.NotificationWebhookURL)
+	}
+
+	if cfg.NotificationWebhookHeaders != "X-Api-Key: secret" {
+		t.Fatalf("expected NOTIFICATION_WEBHOOK_HEADERS to be %q, got %q", "X-Api-Key: secret", cfg.NotificationWebhookHeaders)
+	}
+
+	if cfg.NotificationWebhookLevel != "failure" {
+		t.Fatalf("expected NOTIFICATION_WEBHOOK_LEVEL to be %q, got %q", "failure", cfg.NotificationWebhookLevel)
+	}
+}
+
+func TestGetConfig_NotificationWebhookLevelDefaultsToSuccess(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.NotificationWebhookLevel != "success" {
+		t.Fatalf("expected NOTIFICATION_WEBHOOK_LEVEL to default to %q, got %q", "success", cfg.NotificationWebhookLevel)
+	}
+}
+
+func TestGetConfig_NotificationWebhookHeadersFile(t *testing.T) {
+	headersFile := path.Join(t.TempDir(), "headers")
+	if err := os.WriteFile(headersFile, []byte("X-Api-Key: secret\nX-Source: doco-cd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("NOTIFICATION_WEBHOOK_HEADERS_FILE", headersFile)
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.NotificationWebhookHeaders != "X-Api-Key: secret\nX-Source: doco-cd" {
+		t.Fatalf("expected NOTIFICATION_WEBHOOK_HEADERS to be read from file, got %q", cfg.NotificationWebhookHeaders)
+	}
+}
+
+func TestGetConfig_NotificationWebhookRejectsInvalidURL(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("NOTIFICATION_WEBHOOK_URL", "not-a-url")
+
+	if _, err := GetConfig(); err == nil {
+		t.Fatal("expected invalid NOTIFICATION_WEBHOOK_URL to be rejected")
+	}
+}
+
 func TestGetConfig_DataMountPathRejectsRelativePath(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "info")
 	t.Setenv("HTTP_PORT", "8080")

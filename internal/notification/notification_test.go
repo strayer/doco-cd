@@ -369,6 +369,28 @@ func TestSendIncludesTruncatedRawAppriseResponse(t *testing.T) {
 	}
 }
 
+func TestParseLevel(t *testing.T) {
+	t.Parallel()
+
+	for name, want := range map[string]Level{"info": Info, "success": Success, "warning": Warning, "failure": Failure} {
+		if got, ok := parseLevelStrict(name); !ok || got != want {
+			t.Errorf("parseLevelStrict(%q) = (%v, %v), want (%v, true)", name, got, ok, want)
+		}
+
+		if got := parseLevel(name); got != want {
+			t.Errorf("parseLevel(%q) = %v, want %v", name, got, want)
+		}
+	}
+
+	if got, ok := parseLevelStrict("bogus"); ok {
+		t.Errorf("parseLevelStrict(%q) = (%v, true), want ok=false", "bogus", got)
+	}
+
+	if got := parseLevel("bogus"); got != Info {
+		t.Errorf("parseLevel(%q) = %v, want %v", "bogus", got, Info)
+	}
+}
+
 func TestGetRevision(t *testing.T) {
 	t.Parallel()
 

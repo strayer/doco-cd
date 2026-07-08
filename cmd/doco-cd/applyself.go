@@ -156,6 +156,9 @@ func runSelfBootstrap(ctx context.Context, log *logger.Logger, c *app.Config, do
 		NotifyLevel:           c.AppriseNotifyLevel,
 		BodyTemplate:          c.AppriseNotifyBodyTemplate,
 		FailureRepeatInterval: c.AppriseNotifyRepeatInterval,
+		WebhookURL:            string(c.NotificationWebhookURL),
+		WebhookHeaders:        c.NotificationWebhookHeaders,
+		WebhookLevel:          c.NotificationWebhookLevel,
 	})
 	if err != nil {
 		return fmt.Errorf("create the notifier: %w", err)

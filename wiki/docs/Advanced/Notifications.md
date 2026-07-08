@@ -5,12 +5,16 @@ tags:
   - Notifications
 ---
 
-Doco-CD can be configured to send notifications with [Apprise](https://github.com/caronc/apprise) to various services when a deployment is started, finished, or failed and on [reconciliation](../Deploy-Settings.md#reconciliation-settings) events.
+Doco-CD can be configured to send notifications when a deployment is started, finished, or failed and on [reconciliation](../Deploy-Settings.md#reconciliation-settings) events.
+Notifications can be sent with [Apprise](https://github.com/caronc/apprise) to various services and/or as structured JSON to a [custom webhook endpoint](#webhook-notifications). Both can be used at the same time.
+
+## Apprise notifications
+
 You can find a list of all supported services and platforms in the [Apprise documentation](https://appriseit.com/).
 
 For that, specify the required settings in the app `environment` section and add an Apprise container to your `docker-compose.yml` file.
 
-## Settings
+### Settings
 
 | Key                                 | Type     | Description                                                                                                                                                                                                 | Default value |
 |-------------------------------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
@@ -29,7 +33,7 @@ A request to the Apprise API fails if Apprise does not answer within 30 seconds,
 Doco-CD checks for new releases once at startup.
 Set [`VERSION_CHECK_ENABLED`](../App-Settings.md#runtime-settings) to `false` to skip the GitHub release lookup, new-version warning, and Apprise release announcement.
 
-## Example `docker-compose.yml`
+### Example `docker-compose.yml`
 
 Adjust your `docker-compose.yml` file to include the Apprise service and the necessary environment variables for the app:
 
@@ -61,6 +65,77 @@ services:
       retries: 3
       start_period: 20s
 ```
+
+## Webhook notifications
+
+Doco-CD can send notifications as structured JSON to any HTTP endpoint via `POST` requests, without requiring an Apprise container.
+
+### Settings
+
+| Key                                 | Type   | Description                                                                                                                                            | Default value |
+|-------------------------------------|--------|--------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `NOTIFICATION_WEBHOOK_URL`          | string | The URL of a custom HTTP endpoint to send JSON notifications to via `POST` (e.g. `https://example.com/hooks/doco-cd`)                                 |               |
+| `NOTIFICATION_WEBHOOK_HEADERS`      | string | Optional HTTP headers to send with each request as comma- or newline-separated `Name: value` pairs (e.g. `Authorization: Bearer token123`)            |               |
+| `NOTIFICATION_WEBHOOK_HEADERS_FILE` | string | Path to the file inside the container containing the headers (see `NOTIFICATION_WEBHOOK_HEADERS`). Mutually exclusive with `NOTIFICATION_WEBHOOK_HEADERS`. |               |
+| `NOTIFICATION_WEBHOOK_LEVEL`        | string | The minimum level of notifications to send. Possible values: `info`, `success`, `warning`, `failure`                                                  | `success`     |
+
+### Example payload
+
+```json
+{
+  "level": "success",
+  "title": "Deployment completed",
+  "message": "Successfully deployed stack my-stack",
+  "metadata": {
+    "repository": "github.com/my/repo",
+    "stack": "my-stack",
+    "context": "remote-vm",
+    "target": "prod",
+    "revision": "main (abc123)",
+    "job_id": "b2j8kk0iw1lg",
+    "commits": [
+      {
+        "hash": "abc123def456789",
+        "short_hash": "abc123d",
+        "subject": "fix: increase healthcheck timeout",
+        "author": "Jane Doe"
+      }
+    ],
+    "duration_seconds": 42.5,
+    "changed_services": ["web", "worker"]
+  }
+}
+```
+
+In addition to the [common metadata fields](#metadata-fields), the payload carries: `context` — the Docker context the stack is deployed to; `target` — the custom webhook/poll target suffix (e.g. `prod` for `.doco-cd.prod.yml`); `commits` — the commits deployed since the last deploy (empty on first deploy, failure or OCI); `duration_seconds` — the time from job start to the notification; and `changed_services` — the services this deploy force-recreated or that had image digest drift (empty when the whole stack is (re)deployed).
+
+For notifications triggered by [reconciliation](#reconciliation-notifications), the `metadata` object additionally contains a `reconciliation` object:
+
+```json
+{
+  "level": "failure",
+  "title": "Restart failed",
+  "message": "Failed to restart container",
+  "metadata": {
+    "repository": "github.com/my/repo",
+    "stack": "my-stack",
+    "trace_id": "6f9c2a1b",
+    "reconciliation": {
+      "event": "unhealthy",
+      "actor_kind": "container",
+      "actor_id": "abc123",
+      "actor_name": "my-stack-web-1"
+    }
+  }
+}
+```
+
+!!! note
+
+    - Requests time out after 10 seconds. Any `2xx` response status is treated as success.
+    - Empty metadata fields are omitted from the payload.
+    - Header values containing commas are not supported in the comma-separated form. Use newline-separated pairs instead, e.g. via `NOTIFICATION_WEBHOOK_HEADERS_FILE`.
+    - Doco-CD fails to start if `NOTIFICATION_WEBHOOK_LEVEL` is not one of the listed values or if `NOTIFICATION_WEBHOOK_HEADERS` contains malformed or invalid HTTP headers.
 
 ## Repeated failures
 

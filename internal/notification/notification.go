@@ -98,13 +98,18 @@ type Metadata struct {
 	DeploymentTargetObserver func(stack, context string)
 }
 
-// Config defines the immutable Apprise settings and failure-repeat behavior of a Notifier.
+// Config defines the immutable notification backend settings and failure-repeat behavior of a Notifier.
+// Apprise is used when APIURL and NotifyURLs are set, the webhook backend when WebhookURL is set.
+// Both backends can be configured at the same time.
 type Config struct {
 	APIURL                string
 	NotifyURLs            string
 	NotifyLevel           string
 	BodyTemplate          string
 	FailureRepeatInterval time.Duration
+	WebhookURL            string // URL of a custom HTTP endpoint that receives notifications as JSON
+	WebhookHeaders        string // comma- or newline-separated "Name: value" HTTP headers sent with webhook requests
+	WebhookLevel          string // minimum level sent to the webhook; empty means info, anything else must be a known level
 }
 
 // Sender is the notification capability consumed by application services.
@@ -141,12 +146,17 @@ type Notifier struct {
 	notifyLevel  Level
 	bodyTemplate *template.Template
 
+	webhookURL     string
+	webhookHeaders http.Header
+	webhookLevel   Level
+
 	failureMu             sync.Mutex
 	lastFailures          map[string]failureRecord
 	failureRepeatInterval time.Duration
 }
 
-// New constructs an instance-owned notifier and validates its body template.
+// New constructs an instance-owned notifier and validates its body template
+// and webhook settings.
 func New(config Config) (*Notifier, error) {
 	bodyTemplate, err := validateTemplate(config.BodyTemplate)
 	if err != nil {
@@ -157,11 +167,24 @@ func New(config Config) (*Notifier, error) {
 		bodyTemplate = defaultTemplate
 	}
 
+	webhookHeaders, err := parseWebhookHeaders(config.WebhookHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	webhookLevel, err := parseWebhookLevel(config.WebhookLevel)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Notifier{
 		apiURL:                config.APIURL,
 		notifyURLs:            config.NotifyURLs,
 		notifyLevel:           parseLevel(config.NotifyLevel),
 		bodyTemplate:          bodyTemplate,
+		webhookURL:            config.WebhookURL,
+		webhookHeaders:        webhookHeaders,
+		webhookLevel:          webhookLevel,
 		lastFailures:          make(map[string]failureRecord),
 		failureRepeatInterval: config.FailureRepeatInterval,
 	}, nil
@@ -211,20 +234,26 @@ func validateTemplate(tmpl string) (*template.Template, error) {
 	return t, nil
 }
 
+// parseLevelStrict converts a string representation of a log level to the level type.
+// It reports false if the level is not recognized.
+func parseLevelStrict(name string) (Level, bool) {
+	for lvl, levelName := range logLevels {
+		if levelName == name {
+			return lvl, true
+		}
+	}
+
+	return Info, false
+}
+
 // parseLevel converts a string representation of a log level to the level type.
 func parseLevel(level string) Level {
-	switch level {
-	case logLevels[Info]:
-		return Info
-	case logLevels[Success]:
-		return Success
-	case logLevels[Warning]:
-		return Warning
-	case logLevels[Failure]:
-		return Failure
-	default:
+	parsed, ok := parseLevelStrict(level)
+	if !ok {
 		return Info // Default to Info if the level is not recognized
 	}
+
+	return parsed
 }
 
 // send a notification to the Apprise service.
@@ -462,19 +491,32 @@ func WithoutBodyTemplate() SendOption {
 	}
 }
 
-// configured reports whether notifications are set up at all.
-func (n *Notifier) configured() bool {
+// appriseConfigured reports whether the Apprise backend is set up.
+func (n *Notifier) appriseConfigured() bool {
 	return n != nil && n.apiURL != "" && n.notifyURLs != ""
 }
 
-// Enabled reports whether Send delivers notifications of level: notifications are
-// configured and level is at or above the configured notify level. Send may still
-// suppress an unchanged repeat of a failure that was already reported.
-func (n *Notifier) Enabled(level Level) bool {
-	return n.configured() && level >= n.notifyLevel
+// appriseEnabled reports whether the Apprise backend delivers notifications of level.
+func (n *Notifier) appriseEnabled(level Level) bool {
+	return n.appriseConfigured() && level >= n.notifyLevel
 }
 
-// Send sends a notification using this notifier's Apprise configuration.
+// configured reports whether notifications are set up at all.
+func (n *Notifier) configured() bool {
+	return n.appriseConfigured() || n.webhookConfigured()
+}
+
+// Enabled reports whether Send delivers notifications of level: at least one
+// backend is configured and level is at or above its configured notify level.
+// Send may still suppress an unchanged repeat of a failure that was already
+// reported.
+func (n *Notifier) Enabled(level Level) bool {
+	return n.appriseEnabled(level) || n.webhookEnabled(level)
+}
+
+// Send dispatches a notification to every configured backend whose notify level
+// admits it. Backends are independent: one failing does not prevent the other
+// from being attempted, and the errors of all failed backends are joined.
 func (n *Notifier) Send(level Level, title, message string, metadata Metadata, opts ...SendOption) error {
 	if !n.configured() {
 		return nil
@@ -487,8 +529,8 @@ func (n *Notifier) Send(level Level, title, message string, metadata Metadata, o
 		n.clearFailure(failureKey(metadata))
 	}
 
-	if level < n.notifyLevel {
-		return nil // Do not send notification if the level is lower than the configured level
+	if !n.Enabled(level) {
+		return nil // Do not send notification if the level is lower than every configured level
 	}
 
 	var (
@@ -502,12 +544,56 @@ func (n *Notifier) Send(level Level, title, message string, metadata Metadata, o
 		failureHash = failureFingerprint(title, message)
 		failureSentAt = time.Now()
 
-		// Suppress a failure that is already reported and unchanged, see failure_repeat.go.
+		// Suppress a failure that is already reported and unchanged, see
+		// failure_repeat.go. Checked once for all backends, because
+		// shouldSendFailure records what it lets through.
 		if !n.shouldSendFailure(failureID, failureHash, failureSentAt) {
 			return nil
 		}
 	}
 
+	var (
+		errs      []error
+		delivered bool // at least one backend reached its destination
+	)
+
+	if n.appriseEnabled(level) {
+		err := n.sendApprise(level, title, message, metadata, opts...)
+		if err != nil {
+			errs = append(errs, err)
+		}
+
+		// A partial delivery reached at least one Apprise destination.
+		if err == nil || errors.Is(err, ErrNotifyPartial) {
+			delivered = true
+		}
+	}
+
+	if n.webhookEnabled(level) {
+		err := n.sendWebhook(level, title, message, metadata)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			delivered = true
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	// Nothing reached the operator, so the failure is not reported yet and must
+	// not be suppressed on the next attempt.
+	if level == Failure && !delivered {
+		n.clearUnsentFailure(failureID, failureHash, failureSentAt)
+	}
+
+	return fmt.Errorf("failed to send notification: %w", errors.Join(errs...))
+}
+
+// sendApprise renders the notification with the configured body template and
+// sends it to the Apprise service.
+func (n *Notifier) sendApprise(level Level, title, message string, metadata Metadata, opts ...SendOption) error {
 	var o sendOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -522,16 +608,7 @@ func (n *Notifier) Send(level Level, title, message string, metadata Metadata, o
 
 	title = formatTitle(level, title, metadata)
 
-	err := send(n.apiURL, n.notifyURLs, title, message, logLevels[level])
-	if err != nil {
-		if level == Failure && !errors.Is(err, ErrNotifyPartial) {
-			n.clearUnsentFailure(failureID, failureHash, failureSentAt)
-		}
-
-		return fmt.Errorf("failed to send notification: %w", err)
-	}
-
-	return nil
+	return send(n.apiURL, n.notifyURLs, title, message, logLevels[level])
 }
 
 func formatTitle(level Level, title string, metadata Metadata) string {
